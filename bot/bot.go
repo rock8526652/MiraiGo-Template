@@ -99,12 +99,33 @@ func Init() {
 
 	initBot(account, password)
 
-	signServer := config.GlobalConfig.GetString("sign-server")
+	signServer := config.GlobalConfig.GetString("sign.server")
+	signServerBearer := config.GlobalConfig.GetString("sign.server-bearer")
 	if signServer == "" {
 		fmt.Println("警告: 未配置签名服务器, 这可能会导致登录 45 错误码或发送消息被风控")
 	} else {
+		logger.Infof("使用服务器 %s 进行数据包签名", signServer)
+		if signServerBearer != "" {
+			logger.Infof("使用 Bearer %s 认证签名服务器 %s ", signServerBearer, signServer)
+		}
+		// 等待签名服务器直到连接成功
+		if !signWaitServer() {
+			logger.Fatalf("连接签名服务器失败")
+		}
+		signRegister(account, deviceInfo.AndroidId, deviceInfo.Guid, deviceInfo.QImei36, config.GlobalConfig.GetString("sign.key"))
+		go signStartRefreshToken(config.GlobalConfig.GetInt64("sign.refresh-interval")) // 定时刷新 token
 		wrapper.DandelionEnergy = energy
 		wrapper.FekitGetSign = sign
+		if !config.GlobalConfig.GetBool("sign.is-below-110") {
+			if !config.GlobalConfig.GetBool("sign.auto-register") {
+				logger.Warn("自动注册实例已关闭，若未配置 sign-server 端自动注册实例则实例丢失时需要重启 DDBOT 以正常签名")
+			}
+			if !config.GlobalConfig.GetBool("sign.auto-refresh-token") {
+				logger.Warn("自动刷新 token 已关闭，token 过期后获取签名时将不会立即尝试刷新获取新 token")
+			}
+		} else {
+			logger.Warn("签名服务器版本 <= 1.1.0 ，无法使用刷新 token 等操作，建议使用 1.1.6 版本及以上签名服务器")
+		}
 	}
 }
 
@@ -145,8 +166,8 @@ func GenRandomDevice() {
 }
 
 var remoteVersions = map[int]string{
-	1: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.68/android_phone.json",
-	6: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.68/android_pad.json",
+	1: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.70/android_phone.json",
+	6: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.70/android_pad.json",
 }
 
 func getRemoteLatestProtocolVersion(protocolType int) ([]byte, error) {
