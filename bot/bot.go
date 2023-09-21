@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/Mrs4s/MiraiGo/client"
-	"github.com/starskim/MiraiGo-Template/config"
-	"github.com/starskim/MiraiGo-Template/utils"
+	"github.com/rock8526652/MiraiGo-Template/config"
+	"github.com/rock8526652/MiraiGo-Template/utils"
 	"github.com/sirupsen/logrus"
 	"gopkg.ilharper.com/x/isatty"
 )
@@ -166,8 +166,8 @@ func GenRandomDevice() {
 }
 
 var remoteVersions = map[int]string{
-	1: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.68/android_phone.json",
-	6: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.68/android_pad.json",
+	1: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.70/android_phone.json",
+	6: "https://raw.githubusercontent.com/MrXiaoM/qsign/mirai/txlib/8.9.70/android_pad.json",
 }
 
 func getRemoteLatestProtocolVersion(protocolType int) ([]byte, error) {
