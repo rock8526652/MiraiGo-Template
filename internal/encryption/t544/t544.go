@@ -23,7 +23,7 @@ var (
 
 func init() {
 	encryption.T544Signer["8.9.35.10440"] = sign
-	encryption.T544Signer["8.9.38.10545"] = sign
+	encryption.T544Signer["8.9.70.11635"] = sign
 }
 
 // sign t544 algorithm
