@@ -6,8 +6,8 @@ import (
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/message"
 
-	"github.com/starskim/MiraiGo-Template/bot"
-	"github.com/starskim/MiraiGo-Template/utils"
+	"github.com/rock8526652/MiraiGo-Template/bot"
+	"github.com/rock8526652/MiraiGo-Template/utils"
 )
 
 func init() {
