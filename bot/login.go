@@ -28,26 +28,38 @@ import (
 
 var console = bufio.NewReader(os.Stdin)
 
-func energy(uin uint64, id string, appVersion string, salt []byte) ([]byte, error) {
-	signServer := base.SignServer
+func energy(uin uint64, id string, _ string, salt []byte) ([]byte, error) {
+	signServer := config.GlobalConfig.GetString("sign.server")
 	if !strings.HasSuffix(signServer, "/") {
 		signServer += "/"
 	}
-	response, err := download.Request{
-		Method: http.MethodGet,
-		URL:    signServer + "custom_energy" + fmt.Sprintf("?data=%v&salt=%v", id, hex.EncodeToString(salt)),
-	}.Bytes()
+	query := fmt.Sprintf("?data=%v&salt=%v&uin=%v&android_id=%v&guid=%v",
+		id, hex.EncodeToString(salt), uin, utils.B2S(deviceInfo.AndroidId), hex.EncodeToString(deviceInfo.Guid))
+	if config.GlobalConfig.GetBool("sign.is-below-110") {
+		query = fmt.Sprintf("?data=%v&salt=%v", id, hex.EncodeToString(salt))
+	}
+	resp, err := http.Get(signServer + "custom_energy" + query)
+	signServerBearer := config.GlobalConfig.GetString("sign.server-bearer")
+	if signServerBearer != "" {
+		resp.Header.Set("Authorization", "Bearer "+signServerBearer)
+	}
 	if err != nil {
-		log.Warnf("获取T544 sign时出现错误: %v server: %v", err, signServer)
+		logger.Warnf("获取T544 sign时出现错误: %v server: %v", err, signServer)
+		return nil, err
+	}
+	defer resp.Body.Close()
+	response, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Warnf("获取T544 sign时出现错误: %v server: %v", err, signServer)
 		return nil, err
 	}
 	data, err := hex.DecodeString(gjson.GetBytes(response, "data").String())
 	if err != nil {
-		log.Warnf("获取T544 sign时出现错误: %v", err)
+		logger.Warnf("获取T544 sign时出现错误: %v", err)
 		return nil, err
 	}
 	if len(data) == 0 {
-		log.Warnf("获取T544 sign时出现错误: %v", "data is empty")
+		logger.Warnf("获取T544 sign时出现错误: %v", "data is empty")
 		return nil, errors.New("data is empty")
 	}
 	return data, nil
