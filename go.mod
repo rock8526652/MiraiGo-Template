@@ -1,4 +1,4 @@
-module github.com/starskim/MiraiGo-Template
+module github.com/rock8526652/MiraiGo-Template
 
 go 1.20
 
