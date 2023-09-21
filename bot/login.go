@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/utils"
-	"C:/Users/User/Downloads/MiraiGo-Template/config"
+	"github.com/rock8526652/MiraiGo-Template/config"
 	"github.com/guonaihong/gout"
 	"github.com/mattn/go-colorable"
 	"github.com/pkg/errors"
