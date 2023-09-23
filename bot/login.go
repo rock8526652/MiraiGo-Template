@@ -291,7 +291,7 @@ func signStartRefreshToken(interval int64) {
 }
 
 func signWaitServer() bool {
-	t := time.NewTicker(time.Second * 5)
+	t := time.NewTicker(time.Second * 30)
 	defer t.Stop()
 	i := 0
 	for range t.C {
