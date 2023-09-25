@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/Mrs4s/MiraiGo/client"
-	"github.com/Sora233/MiraiGo-Template/config"
-	"github.com/Sora233/MiraiGo-Template/utils"
+	"github.com/rock8526652/MiraiGo-Template/config"
+	"github.com/rock8526652/MiraiGo-Template/utils"
 	"github.com/sirupsen/logrus"
 	"gopkg.ilharper.com/x/isatty"
 )
