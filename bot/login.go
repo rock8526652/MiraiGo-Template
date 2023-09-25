@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/utils"
-	"github.com/Sora233/MiraiGo-Template/internal/requests"
+	"github.com/rock8526652/MiraiGo-Template/internal/requests"
 	"github.com/mattn/go-colorable"
 	"github.com/pkg/errors"
 	"image"
