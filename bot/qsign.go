@@ -17,8 +17,8 @@ import (
 
 	"github.com/Mrs4s/MiraiGo/utils"
 
-	"github.com/Sora233/MiraiGo-Template/config"
-	"github.com/Sora233/MiraiGo-Template/internal/requests"
+	"github.com/rock8526652/MiraiGo-Template/config"
+	"github.com/rock8526652/MiraiGo-Template/internal/requests"
 )
 
 type currentSignServer atomic.Pointer[config.SignServer]
