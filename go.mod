@@ -1,4 +1,4 @@
-module github.com/Sora233/MiraiGo-Template
+module github.com/rock8526652/MiraiGo-Template
 
 go 1.20
 
