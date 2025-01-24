@@ -157,6 +157,7 @@ func GenRandomDevice() {
 }
 
 var remoteVersions = map[int]string{
+	6: "https://raw.githubusercontent.com/rock8526652/txlib/refs/heads/main/txlib/android_pad.json",
 }
 
 func getRemoteLatestProtocolVersion(protocolType int) ([]byte, error) {
