@@ -1,231 +1,400 @@
-package bot
+package gocq
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ProtocolScience/AstralGo/client"
+	"github.com/ProtocolScience/AstralGo/utils"
+	"github.com/ProtocolScience/AstralGocq/server"
+	"github.com/RomiChan/websocket"
+	"github.com/google/uuid"
+
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
-
-	"github.com/Mrs4s/MiraiGo/utils"
 
 	"github.com/rock8526652/MiraiGo-Template/config"
 	"github.com/rock8526652/MiraiGo-Template/internal/requests"
 )
 
-type currentSignServer atomic.Pointer[config.SignServer]
+// SignServerManager manages the current sign server and handles server selection.
+type SignServerManager struct {
+	current  atomic.Pointer[config.SignServer]
+	errCount atomic.Uintptr
+	client   *SignClient
+}
 
-func (c *currentSignServer) get() *config.SignServer {
+// NewSignServerManager creates a new SignServerManager instance.
+func NewSignServerManager(client *SignClient) *SignServerManager {
+	return &SignServerManager{client: client}
+}
+
+// Get returns the current sign server.
+func (m *SignServerManager) Get() *config.SignServer {
 	if len(config.SignServers) == 1 {
-		// 只配置了一个签名服务时不检查以及切换, 在get阶段返回，防止返回nil导致其他bug（可能）
 		return &config.SignServers[0]
 	}
-	return (*atomic.Pointer[config.SignServer])(c).Load()
+	return m.current.Load()
 }
 
-func (c *currentSignServer) set(server *config.SignServer) {
-	(*atomic.Pointer[config.SignServer])(c).Store(server)
+// Set updates the current sign server.
+func (m *SignServerManager) Set(server *config.SignServer) {
+	if server == nil {
+		cur := m.current.Load()
+		if cur != nil && len(cur.URL) > 0 {
+			log.Warnf("Current server %v unavailable, searching for a new one", cur.URL)
+		}
+	}
+	m.current.Store(server)
 }
 
-// 当前签名服务器
-var ss currentSignServer
-
-// 失败计数
-type errconut atomic.Uintptr
-
-func (ec *errconut) hasOver(count uintptr) bool {
-	return (*atomic.Uintptr)(ec).Load() > count
+// IncrementErrorCount increases the error count by one.
+func (m *SignServerManager) IncrementErrorCount() {
+	m.errCount.Add(1)
 }
 
-func (ec *errconut) inc() {
-	(*atomic.Uintptr)(ec).Add(1)
+// HasOver checks if the error count exceeds the specified value.
+func (m *SignServerManager) HasOver(count uintptr) bool {
+	return m.errCount.Load() > count
 }
 
-var errn errconut
-
-// getAvaliableSignServer 获取可用的签名服务器，没有则返回空和相应错误
-func getAvaliableSignServer() (*config.SignServer, error) {
-	cs := ss.get()
-	if cs != nil {
-		return cs, nil
+// GetAvailableSignServer retrieves an available sign server or returns an error if none are available.
+func (m *SignServerManager) GetAvailableSignServer() (*config.SignServer, error) {
+	s := m.Get()
+	if s != nil {
+		return s, nil
 	}
 	if len(config.SignServers) == 0 {
 		return nil, errors.New("no sign server configured")
 	}
-	maxCount := config.Sign.MaxCheckCount
+	maxCount := config.Account.MaxCheckCount
 	if maxCount == 0 {
-		if errn.hasOver(3) {
-			logger.Warn("已连续 3 次获取不到可用签名服务器，将固定使用主签名服务器")
-			ss.set(&config.SignServers[0])
-			return ss.get(), nil
+		if m.HasOver(3) {
+			log.Warn("已连续 3 次获取不到可用签名服务器，将固定使用主签名服务器")
+			m.Set(&config.SignServers[0])
+			return m.Get(), nil
 		}
-	} else if errn.hasOver(uintptr(maxCount)) {
-		logger.Fatalf("获取可用签名服务器失败次数超过 %v 次, 正在离线", maxCount)
+	} else if m.HasOver(uintptr(maxCount)) {
+		log.Fatalf("获取可用签名服务器失败次数超过 %v 次, 正在离线", maxCount)
 	}
-	if cs != nil && len(cs.URL) > 0 {
-		logger.Warnf("当前签名服务器 %v 不可用，正在查找可用服务器", cs.URL)
-	}
-	cs = asyncCheckServer(config.SignServers)
-	if cs == nil {
+	s = m.asyncCheckServers(config.SignServers)
+	if s == nil {
 		return nil, errors.New("no usable sign server")
 	}
-	return cs, nil
+	return s, nil
 }
 
-func isServerAvaliable(signServer string) bool {
-	resp, err := requests.Request{
-		Method: http.MethodGet,
-		URL:    signServer,
-	}.WithTimeout(3 * time.Second).Bytes()
-	if err == nil && gjson.GetBytes(resp, "code").Int() == 0 {
-		return true
+func (m *SignServerManager) asyncCheckServers(servers []config.SignServer) *config.SignServer {
+	var once sync.Once
+	var wg sync.WaitGroup
+
+	checkServers := func(servers []config.SignServer) bool {
+		success := false
+		wg.Add(len(servers))
+		for i, s := range servers {
+			go func(i int, server config.SignServer) {
+				defer wg.Done()
+				if isServerAvailable(server.URL) {
+					log.Infof("检查签名服务器: %v (%v/%v) ok!", server.URL, i+1, len(servers))
+					m.Set(&server)
+					if m.client.signRegister() {
+						once.Do(func() {
+							log.Infof("使用签名服务器 url=%v, key=%v, auth=%v", server.URL, server.Key, server.Authorization)
+							success = true
+						})
+					}
+				} else {
+					log.Warnf("检查签名服务器: %v (%v/%v) failed!", server.URL, i+1, len(servers))
+				}
+			}(i, s)
+		}
+		wg.Wait()
+		return success
 	}
-	logger.Warnf("签名服务器 %v 可能不可用，请求出现错误：%v", signServer, err)
+
+	checkServers(servers)
+
+	return m.Get()
+}
+
+func isServerAvailable(signServer string) bool {
+	parsedURL, err := url.Parse(signServer)
+	if err != nil {
+		log.Warnf("Invalid URL: %v, error: %v", signServer, err)
+		return false
+	}
+	switch parsedURL.Scheme {
+	case "http", "https":
+		return isHTTPAvailable(signServer)
+	case "ws", "wss":
+		return isWebSocketAvailable(signServer)
+	default:
+		log.Errorf("Unsupported protocol: %v", parsedURL.Scheme)
+		return false
+	}
+}
+
+func isHTTPAvailable(url string) bool {
+	httpClient := http.Client{
+		Timeout: 3 * time.Second,
+	}
+
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		log.Warnf("HTTP check failed for %v, error: %v", url, err)
+		return false
+	}
+	bodyBytes, e := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		if e == nil && gjson.GetBytes(bodyBytes, "code").Int() == 0 {
+			return true
+		}
+	}
 	return false
 }
 
-// asyncCheckServer 按同步顺序检查所有签名服务器直到找到可用的
-func asyncCheckServer(servers []config.SignServer) *config.SignServer {
-	doRegister := sync.Once{}
-	wg := sync.WaitGroup{}
-	wg.Add(len(servers))
-	for i, s := range servers {
-		go func(i int, server config.SignServer) {
-			defer wg.Done()
-			logger.Infof("检查签名服务器：%v  (%v/%v)", server.URL, i+1, len(servers))
-			if len(server.URL) < 4 {
-				return
-			}
-			if isServerAvaliable(server.URL) {
-				doRegister.Do(func() {
-					ss.set(&server)
-					logger.Infof("使用签名服务器 url=%v, key=%v, auth=%v", server.URL, server.Key, server.Authorization)
-					if config.Sign.AutoRegister {
-						// 若配置了自动注册实例则在切换后注册实例，否则不需要注册，签名时由qsign自动注册
-						signRegister(config.Bot.Account, deviceInfo.AndroidId, deviceInfo.Guid, deviceInfo.QImei36, server.Key)
-					}
-				})
-			}
-		}(i, s)
+func isWebSocketAvailable(url string) bool {
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 3 * time.Second,
 	}
-	wg.Wait()
-	return ss.get()
+
+	conn, resp, err := dialer.Dial(url, nil)
+	if err != nil {
+		log.Warnf("WebSocket check failed for %v, error: %v", url, err)
+		return false
+	}
+	_ = resp.Body.Close()
+	_ = conn.Close()
+
+	// Optionally, you can send a ping or some message to verify further
+
+	return true
 }
 
-/*
-请求签名服务器
-
-	url: api + params 组合的字符串，无须包含签名服务器地址
-	return: signServer, response, error
-*/
-func requestSignServer(method string, url string, headers map[string]string, body io.Reader) (string, []byte, error) {
-	signServer, e := getAvaliableSignServer()
-	if e != nil && len(signServer.URL) == 0 { // 没有可用的
-		logger.Warnf("获取可用签名服务器出错：%v, 将使用主签名服务器进行签名", e)
-		errn.inc()
-		signServer = &config.SignServers[0] // 没有获取到时使用第一个
-	}
-	if !strings.HasPrefix(url, signServer.URL) {
-		url = strings.TrimSuffix(signServer.URL, "/") + "/" + strings.TrimPrefix(url, "/")
-	}
-	if headers == nil {
-		headers = map[string]string{}
-	}
-	auth := signServer.Authorization
-	if auth != "-" && auth != "" {
-		headers["Authorization"] = auth
-	}
-	req := requests.Request{
-		Method: method,
-		Header: headers,
-		URL:    url,
-		Body:   body,
-	}.WithTimeout(time.Duration(config.SignServerTimeout) * time.Second)
-	resp, err := req.Bytes()
-	if err != nil {
-		ss.set(nil) // 标记为不可用
-	}
-	return signServer.URL, resp, err
+// SignClient handles requests to the sign server.
+type SignClient struct {
+	client    *client.QQClient
+	manager   *SignServerManager
+	ws        *websocket.Conn
+	requests  map[string]chan map[string]interface{}
+	requestMu sync.Mutex
 }
 
-func energy(uin uint64, id string, _ string, salt []byte) ([]byte, error) {
-	url := "custom_energy" + fmt.Sprintf("?data=%v&salt=%v&uin=%v&android_id=%v&guid=%v",
-		id, hex.EncodeToString(salt), uin, utils.B2S(deviceInfo.AndroidId), hex.EncodeToString(deviceInfo.Guid))
-	if config.IsBelow110 {
-		url = "custom_energy" + fmt.Sprintf("?data=%v&salt=%v", id, hex.EncodeToString(salt))
-	}
-	signServer, response, err := requestSignServer(http.MethodGet, url, nil, nil)
-	if err != nil {
-		logger.Warnf("获取T544 sign时出现错误: %v. server: %v", err, signServer)
-		return nil, err
-	}
-	data, err := hex.DecodeString(gjson.GetBytes(response, "data").String())
-	if err != nil {
-		logger.Warnf("获取T544 sign时出现错误: %v (data: %v)", err, gjson.GetBytes(response, "data").String())
-		return nil, err
-	}
-	if len(data) == 0 {
-		logger.Warnf("获取T544 sign时出现错误: %v.", "data is empty")
-		return nil, errors.New("data is empty")
-	}
-	return data, nil
+// NewSignClient creates a new SignClient instance.
+func NewSignClient(c *client.QQClient) *SignClient {
+	signClient := &SignClient{client: c, requests: make(map[string]chan map[string]interface{})}
+	signClient.manager = NewSignServerManager(signClient)
+	return signClient
 }
-
-// signSubmit
-// 提交回调 buffer
-func signSubmit(uin string, cmd string, callbackID int64, buffer []byte, t string) {
-	buffStr := hex.EncodeToString(buffer)
-	tail := 64
-	endl := "..."
-	if len(buffStr) < tail {
-		tail = len(buffStr)
-		endl = "."
+func (c *SignClient) resetWebsocket() {
+	c.requestMu.Lock()
+	if c.ws != nil {
+		_ = c.ws.Close()
+		c.ws = nil // Reset connection
 	}
-	logger.Infof("submit (%v): uin=%v, cmd=%v, callbackID=%v, buffer=%v%s", t, uin, cmd, callbackID, buffStr[:tail], endl)
-
-	signServer, _, err := requestSignServer(
-		http.MethodGet,
-		"submit"+fmt.Sprintf("?uin=%v&cmd=%v&callback_id=%v&buffer=%v",
-			uin, cmd, callbackID, buffStr),
-		nil, nil,
-	)
-	if err != nil {
-		logger.Warnf("提交 callback 时出现错误: %v. server: %v", err, signServer)
-	}
+	c.requestMu.Unlock()
 }
-
-// signCallback
-// 刷新 token 和签名的回调
-func signCallback(uin string, results []gjson.Result, t string) {
-	for _, result := range results {
-		cmd := result.Get("cmd").String()
-		callbackID := result.Get("callbackId").Int()
-		body, _ := hex.DecodeString(result.Get("body").String())
-		ret, err := Instance.SendSsoPacket(cmd, body)
-		if err != nil || len(ret) == 0 {
-			logger.Warnf("Callback error: %v, or response data is empty", err)
-			continue // 发送 SsoPacket 出错或返回数据为空时跳过
+func (c *SignClient) requestSignServer(action string, data map[string]string) (string, []byte, error) {
+	i := 0
+	for {
+		headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+		signServer, err := c.manager.GetAvailableSignServer()
+		if err != nil || signServer == nil || len(signServer.URL) == 0 {
+			log.Warnf("获取可用签名服务器出错：%v, 将使用主签名服务器进行签名", err)
+			c.manager.IncrementErrorCount()
+			signServer = &config.SignServers[0]
 		}
-		signSubmit(uin, cmd, callbackID, ret, t)
+		data["key"] = signServer.Key
+		data["uin"] = strconv.FormatInt(config.Account.Uin, 10)
+
+		data["qua"] = device.Protocol.Version().QUA
+		data["android_id"] = utils.B2S(device.AndroidId)
+		data["guid"] = hex.EncodeToString(device.Guid)
+		data["qimei36"] = device.QImei36
+		var resp []byte
+		if strings.HasPrefix(signServer.URL, "ws://") || strings.HasPrefix(signServer.URL, "wss://") {
+			a, e := c.requestWebSocket(signServer, action, data)
+			err = e
+			resp = a
+		} else {
+			//HTTP ABOVE
+			urlAddress := strings.TrimSuffix(signServer.URL, "/") + "/" + strings.TrimPrefix(action, "/")
+			auth := signServer.Authorization
+			if auth != "-" && auth != "" {
+				headers["Authorization"] = auth
+			}
+
+			var bodyBytes bytes.Buffer
+			for key, value := range data {
+				bodyBytes.WriteString(fmt.Sprintf("%v=%v&", key, value))
+			}
+			bodyString := bodyBytes.String()
+			bodyString = bodyString[:len(bodyString)-1]
+			body := bytes.NewBufferString(bodyString)
+			//log.Infof("POST: %s \n %s", urlAddress, bodyString)
+			hash := md5.New()
+			hash.Write([]byte("37mWT8rCCNyT2Zi11ACT8pbhe8wCRSKG"))
+			hash.Write(body.Bytes())
+			headers["gocq-ticket"] = hex.EncodeToString(hash.Sum(nil))
+
+			req := requests.Request{
+				Method: http.MethodPost,
+				Header: headers,
+				URL:    urlAddress,
+				Body:   body,
+			}.WithTimeout(time.Duration(config.SignServerTimeout) * time.Second)
+			a, e := req.Bytes()
+			if e != nil {
+				c.manager.Set(nil)
+			}
+			err = e
+			resp = a
+		}
+		if err == nil || i == 1 {
+			return signServer.URL, resp, err
+		}
+		i++
 	}
 }
 
-func signRequset(seq uint64, uin string, cmd string, qua string, buff []byte) (sign []byte, extra []byte, token []byte, err error) {
-	headers := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
-	_, response, err := requestSignServer(
-		http.MethodPost,
+func (c *SignClient) requestWebSocket(signServer *config.SignServer, action string, data map[string]string) ([]byte, error) {
+	// Establish WebSocket connection if not connected
+	c.requestMu.Lock()
+	if c.ws == nil {
+		header := http.Header{}
+		network, address := server.ResolveURI(signServer.URL)
+		dialer := websocket.Dialer{
+			NetDial: func(_, addr string) (net.Conn, error) {
+				if network == "unix" {
+					host, _, err := net.SplitHostPort(addr)
+					if err != nil {
+						host = addr
+					}
+					filepath, err := base64.RawURLEncoding.DecodeString(host)
+					if err == nil {
+						addr = string(filepath)
+					}
+				}
+				return net.Dial(network, addr) // support unix socket transport
+			},
+		}
+		conn, _, err := dialer.Dial(address, header) // nolint
+		if err != nil {
+			return nil, err
+		}
+		c.ws = conn
+		go c.listenResponses() // Start listening for responses
+	}
+	c.requestMu.Unlock()
+
+	// Generate a unique echo UUID
+	echoUUID := uuid.New().String()
+
+	// Prepare JSON message
+	message := map[string]interface{}{
+		"type":   action,
+		"params": data,
+		"echo":   echoUUID,
+	}
+
+	// Create a channel to wait for the response
+	responseChan := make(chan map[string]interface{})
+
+	// Register the request
+	c.requestMu.Lock()
+	// Send message
+	err := c.ws.WriteJSON(message)
+	if err == nil {
+		c.requests[echoUUID] = responseChan
+	}
+	c.requestMu.Unlock()
+	if err != nil {
+		c.resetWebsocket()
+		return nil, err
+	}
+	// Set a timeout duration
+	timeout := time.Duration(config.SignServerTimeout) * time.Second
+	select {
+	case response := <-responseChan:
+		// Process the response
+		c.requestMu.Lock()
+		delete(c.requests, echoUUID)
+		c.requestMu.Unlock()
+		// Extract payload
+		payload, e := json.Marshal(response["payload"])
+		if e != nil {
+			return nil, e
+		}
+		return payload, nil
+	case <-time.After(timeout):
+		// Handle the timeout case
+		c.requestMu.Lock()
+		delete(c.requests, echoUUID)
+		c.requestMu.Unlock()
+		c.resetWebsocket()
+		return nil, errors.New("operation timed out in qsign websocket request")
+	}
+}
+
+func (c *SignClient) listenResponses() {
+	for {
+		var response map[string]interface{}
+		// ReadJSON in a function that sets c.ws to nil and panics on error
+		err := func() error {
+			defer func() {
+				_ = recover()
+			}()
+			err := c.ws.ReadJSON(&response)
+			if err != nil {
+				return err
+			}
+			return nil
+		}()
+		if err != nil {
+			break
+		}
+		if response == nil {
+			break
+		}
+
+		// Handle the response
+		echo, ok := response["echo"].(string)
+		if !ok {
+			log.Error("Invalid qsign websocket response format")
+			continue
+		}
+
+		c.requestMu.Lock()
+		if responseChan, found := c.requests[echo]; found {
+			responseChan <- response
+		}
+		c.requestMu.Unlock()
+	}
+	c.resetWebsocket()
+}
+
+func (c *SignClient) signRequest(seq uint64, uin string, cmd string, buff []byte) (sign []byte, extra []byte, token []byte, err error) {
+	_, response, err := c.requestSignServer(
 		"sign",
-		headers,
-		bytes.NewReader([]byte(fmt.Sprintf("uin=%v&qua=%s&cmd=%s&seq=%v&buffer=%v&android_id=%v&guid=%v",
-			uin, qua, cmd, seq, hex.EncodeToString(buff), utils.B2S(deviceInfo.AndroidId), hex.EncodeToString(deviceInfo.Guid)))),
+		map[string]string{
+			"cmd":    cmd,
+			"seq":    strconv.FormatUint(seq, 10),
+			"buffer": hex.EncodeToString(buff),
+		},
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -233,185 +402,148 @@ func signRequset(seq uint64, uin string, cmd string, qua string, buff []byte) (s
 	sign, _ = hex.DecodeString(gjson.GetBytes(response, "data.sign").String())
 	extra, _ = hex.DecodeString(gjson.GetBytes(response, "data.extra").String())
 	token, _ = hex.DecodeString(gjson.GetBytes(response, "data.token").String())
-	if !config.IsBelow110 {
-		go signCallback(uin, gjson.GetBytes(response, "data.requestCallback").Array(), "sign")
-	}
+	go c.signCallback(uin, gjson.GetBytes(response, "data.requestCallback").Array(), "sign")
 	return sign, extra, token, nil
 }
 
-var registerLock sync.Mutex
-
-func signRegister(uin int64, androidID, guid []byte, qimei36, key string) {
-	if config.IsBelow110 {
-		logger.Warn("签名服务器版本低于1.1.0, 跳过实例注册")
-		return
-	}
-	signServer, resp, err := requestSignServer(
-		http.MethodGet,
-		"register"+fmt.Sprintf("?uin=%v&android_id=%v&guid=%v&qimei36=%v&key=%s",
-			uin, utils.B2S(androidID), hex.EncodeToString(guid), qimei36, key),
-		nil, nil,
-	)
-	if err != nil {
-		logger.Warnf("注册QQ实例时出现错误: %v. server: %v", err, signServer)
-		return
-	}
-	msg := gjson.GetBytes(resp, "msg")
-	if gjson.GetBytes(resp, "code").Int() != 0 {
-		logger.Warnf("注册QQ实例时出现错误: %v. server: %v", msg, signServer)
-		return
-	}
-	logger.Infof("注册QQ实例 %v 成功: %v", uin, msg)
-}
-
-func signRefreshToken(uin string) error {
-	logger.Info("正在刷新 token")
-	_, resp, err := requestSignServer(
-		http.MethodGet,
-		"request_token?uin="+uin,
-		nil, nil,
-	)
-	if err != nil {
-		return err
-	}
-	msg := gjson.GetBytes(resp, "msg")
-	code := gjson.GetBytes(resp, "code")
-	if code.Int() != 0 {
-		return errors.New("code=" + code.String() + ", msg: " + msg.String())
-	}
-	go signCallback(uin, gjson.GetBytes(resp, "data").Array(), "request token")
-	return nil
-}
-
-var missTokenCount = uint64(0)
-var lastToken = ""
-
-func sign(seq uint64, uin string, cmd string, qua string, buff []byte) (sign []byte, extra []byte, token []byte, err error) {
-	i := 0
+func (c *SignClient) signCallback(uin string, results []gjson.Result, t string) {
 	for {
-
-		sign, extra, token, err = signRequset(seq, uin, cmd, qua, buff)
-		cs := ss.get()
-		if cs == nil {
-			// 最好在请求后判断，否则若被设置为nil后不会再请求签名，
-			// 导致在下一次有请求签名服务操作之前，ss无法更新
-			err = errors.New("nil signserver")
-			logger.Warn("nil sign-server") // 返回的err并不会log出来，加条日志
-			return
-		}
-		if err != nil {
-			logger.Warnf("获取sso sign时出现错误: %v. server: %v", err, cs.URL)
-		}
-		if i > 0 {
+		if c.client.Online.Load() {
 			break
 		}
-		i++
-		if (!config.IsBelow110) && config.Sign.AutoRegister && err == nil && len(sign) == 0 {
-			if registerLock.TryLock() { // 避免并发时多处同时销毁并重新注册
-				logger.Debugf("请求签名：cmd=%v, qua=%v, buff=%v", seq, cmd, hex.EncodeToString(buff))
-				logger.Debugf("返回结果：sign=%v, extra=%v, token=%v",
-					hex.EncodeToString(sign), hex.EncodeToString(extra), hex.EncodeToString(token))
-				logger.Warn("获取签名为空，实例可能丢失，正在尝试重新注册")
-				defer registerLock.Unlock()
-				err := signServerDestroy(uin)
-				if err != nil {
-					logger.Warnln(err) // 实例真的丢失时则必出错，或许应该不 return , 以重新获取本次签名
-					// return nil, nil, nil, err
-				}
-				signRegister(config.Bot.Account, deviceInfo.AndroidId, deviceInfo.Guid, deviceInfo.QImei36, cs.Key)
-			}
+		time.Sleep(1 * time.Second)
+	}
+	for _, result := range results {
+		cmd := result.Get("cmd").String()
+		callbackID := result.Get("callbackId").Int()
+		body, _ := hex.DecodeString(result.Get("body").String())
+		ret, err := c.client.SendSsoPacket(cmd, body)
+		if err != nil || len(ret) == 0 {
+			log.Warnf("Callback error: %v, or response data is empty", err)
 			continue
 		}
-		if (!config.IsBelow110) && config.Sign.AutoRefreshToken && len(token) == 0 {
-			logger.Warnf("token 已过期, 总丢失 token 次数为 %v", atomic.AddUint64(&missTokenCount, 1))
-			if registerLock.TryLock() {
-				defer registerLock.Unlock()
-				if err := signRefreshToken(uin); err != nil {
-					logger.Warnf("刷新 token 出现错误: %v. server: %v", err, cs.URL)
-				} else {
-					logger.Info("刷新 token 成功")
-				}
-			}
+		c.signSubmit(uin, cmd, callbackID, ret, t)
+	}
+}
+
+func (c *SignClient) signSubmit(uin string, cmd string, callbackID int64, buffer []byte, t string) {
+	buffStr := hex.EncodeToString(buffer)
+	if config.Debug {
+		tail := 64
+		endl := "..."
+		if len(buffStr) < tail {
+			tail = len(buffStr)
+			endl = "."
+		}
+		log.Debugf("submit (%v): uin=%v, cmd=%v, callbackID=%v, buffer=%v%s", t, uin, cmd, callbackID, buffStr[:tail], endl)
+	}
+
+	signServer, _, err := c.requestSignServer(
+		"submit",
+		map[string]string{
+			"cmd":         cmd,
+			"callback_id": strconv.FormatInt(callbackID, 10),
+			"buffer":      buffStr,
+		},
+	)
+
+	if err != nil {
+		log.Warnf("提交 callback 时出现错误: %v. server: %v", err, signServer)
+	}
+}
+
+// SignWhiteList retrieves the sign whitelist.
+func (c *SignClient) SignWhiteList() (whitelist []string, err error) {
+	_, response, err := c.requestSignServer(
+		"cmd_whitelist",
+		map[string]string{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if gjson.GetBytes(response, "code").Int() == 0 {
+		results := gjson.GetBytes(response, "data.list").Array()
+		stringResults := make([]string, len(results))
+		for i, result := range results {
+			stringResults[i] = result.String()
+		}
+		return stringResults, nil
+	}
+	return nil, errors.New("get whitelist failed")
+}
+func (c *SignClient) signRegister() bool {
+	signServer, resp, err := c.requestSignServer(
+		"register",
+		map[string]string{},
+	)
+	if err != nil {
+		log.Warnf("Error registering QQ instance: %v. server: %v", err, signServer)
+		return false
+	}
+	msg := gjson.GetBytes(resp, "msg")
+	if !msg.Exists() {
+		log.Warn("Error registering QSign")
+		return false
+	}
+	if gjson.GetBytes(resp, "code").Int() != 0 {
+		log.Warnf("Error registering QQ instance: %v. server: %v", msg, signServer)
+		return false
+	}
+	log.Infof("Successfully registered QQ instance %v: %v", config.Account.Uin, msg)
+	return true
+}
+
+// Energy requests energy data from the sign server.
+func (c *SignClient) Energy(id string, sdkVersion string, salt []byte) ([]byte, error) {
+	signServer, response, err := c.requestSignServer(
+		"custom_energy",
+		map[string]string{
+			"data":    id,
+			"version": sdkVersion,
+			"salt":    hex.EncodeToString(salt),
+		},
+	)
+
+	if err != nil {
+		log.Warnf("Error getting energy sign: %v. server: %v", err, signServer)
+		return nil, err
+	}
+	data, err := hex.DecodeString(gjson.GetBytes(response, "data").String())
+	if err != nil {
+		log.Warnf("Error decoding energy sign: %v (data: %v)", err, gjson.GetBytes(response, "data").String())
+		return nil, err
+	}
+	if len(data) == 0 {
+		log.Warnf("Error: data is empty.")
+		return nil, errors.New("data is empty")
+	}
+	return data, nil
+}
+
+// Sign sends a sign request and returns the sign, extra, and token data.
+func (c *SignClient) Sign(seq uint64, uin string, cmd string, buff []byte) (sign []byte, extra []byte, token []byte, err error) {
+	i := 0
+	for {
+		i++
+		if i > 5 {
+			log.Warn("too many tried sign")
+			return nil, nil, nil, errors.New("too many tried")
+		}
+		cs, e := c.manager.GetAvailableSignServer()
+		if e != nil || cs == nil {
+			log.Warn("nil sign-server")
+			return sign, extra, token, errors.New("nil sign-server")
+		}
+		sign, extra, token, err = c.signRequest(seq, uin, cmd, buff)
+		if err != nil {
+			log.Warnf("Error getting sso sign: %v. server: %v", err, cs.URL)
 			continue
 		}
 		break
 	}
-	if tokenString := hex.EncodeToString(token); lastToken != tokenString {
-		logger.Infof("token 已更新：%v -> %v", lastToken, tokenString)
-		lastToken = tokenString
-	}
-	rule := config.Sign.RuleChangeSignServer
+	rule := config.Account.RuleChangeSignServer
 	if (len(sign) == 0 && rule >= 1) || (len(token) == 0 && rule >= 2) {
-		ss.set(nil)
+		c.manager.Set(nil)
 	}
 	return sign, extra, token, err
-}
-
-func signServerDestroy(uin string) error {
-	signServer, signVersion, err := signVersion()
-	if err != nil {
-		return errors.Wrapf(err, "获取签名服务版本出现错误, server: %v", signServer)
-	}
-	if "v"+signVersion > "v1.1.6" {
-		return errors.Errorf("当前签名服务器版本 %v 低于 1.1.6，无法使用 destroy 接口", signVersion)
-	}
-	cs := ss.get()
-	if cs == nil {
-		return errors.New("nil signserver")
-	}
-	signServer, resp, err := requestSignServer(
-		http.MethodGet,
-		"destroy"+fmt.Sprintf("?uin=%v&key=%v", uin, cs.Key),
-		nil, nil,
-	)
-	if err != nil || gjson.GetBytes(resp, "code").Int() != 0 {
-		return errors.Wrapf(err, "destroy 实例出现错误, server: %v", signServer)
-	}
-	return nil
-}
-
-func signVersion() (signServer string, version string, err error) {
-	signServer, resp, err := requestSignServer(http.MethodGet, "", nil, nil)
-	if err != nil {
-		return signServer, "", err
-	}
-	if gjson.GetBytes(resp, "code").Int() == 0 {
-		return signServer, gjson.GetBytes(resp, "data.version").String(), nil
-	}
-	return signServer, "", errors.New("empty version")
-}
-
-// 定时刷新 token, interval 为间隔时间（分钟）
-func signStartRefreshToken(interval int64) {
-	if interval <= 0 {
-		logger.Warn("定时刷新 token 已关闭")
-		return
-	}
-	logger.Infof("每 %v 分钟将刷新一次签名 token", interval)
-	if interval < 10 {
-		logger.Warnf("间隔时间 %v 分钟较短，推荐 30~40 分钟", interval)
-	}
-	if interval > 60 {
-		logger.Warn("间隔时间不能超过 60 分钟，已自动设置为 60 分钟")
-		interval = 60
-	}
-	t := time.NewTicker(time.Duration(interval) * time.Minute)
-	qqstr := strconv.FormatInt(config.Bot.Account, 10)
-	defer t.Stop()
-	for range t.C {
-		cs, master := ss.get(), &config.SignServers[0]
-		if (cs == nil || cs.URL != master.URL) && isServerAvaliable(master.URL) {
-			ss.set(master)
-			logger.Infof("主签名服务器可用，已切换至主签名服务器 %v", cs.URL)
-		}
-		cs = ss.get()
-		if cs == nil {
-			logger.Warn("无法获得可用签名服务器，停止 token 定时刷新")
-			return
-		}
-		err := signRefreshToken(qqstr)
-		if err != nil {
-			logger.Warnf("刷新 token 出现错误: %v. server: %v", err, cs.URL)
-		}
-	}
 }
