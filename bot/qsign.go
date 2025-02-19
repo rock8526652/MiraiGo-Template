@@ -1,4 +1,4 @@
-package gocq
+package bot
 
 import (
 	"bytes"
